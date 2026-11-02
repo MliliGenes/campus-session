@@ -1,0 +1,92 @@
+#!/bin/bash
+# Run once from GNOME autostart, or manually with session-apply.
+# Does not require sudo. Optional preferences live below.
+set -u
+umask 077
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/campus-session"
+mkdir -p "$state_dir" || exit 1
+# Keep only the last run's log.
+exec >"$state_dir/last-run.log" 2>&1
+printf 'Started: %s\n' "$(date -Is)"
+if [[ -n ${XDG_RUNTIME_DIR:-} ]] && command -v flock >/dev/null; then
+    exec 9>"$XDG_RUNTIME_DIR/campus-session.lock"
+    flock -n 9 || exit 0
+fi
+
+# Check the installed schema/key and respect administrator locks.
+set_pref() {
+    local schema=$1 key=$2 value=$3 writable
+    if ! writable=$(gsettings writable "$schema" "$key" 2>/dev/null); then
+        printf 'Unavailable: %s %s\n' "$schema" "$key"
+    elif [[ $writable != true ]]; then
+        printf 'Locked: %s %s\n' "$schema" "$key"
+    elif ! gsettings set "$schema" "$key" "$value"; then
+        printf 'Failed: %s %s\n' "$schema" "$key"
+    fi
+    return 0
+}
+
+apply_preferences() {
+    set_pref org.gnome.desktop.interface cursor-size 28
+
+    # Optional: uncomment only the preferences you want.
+    # Avoid automatic brightness changes (on machines with a light sensor).
+    set_pref org.gnome.settings-daemon.plugins.power ambient-enabled false
+    # Avoid dimming while idle; screen locking remains unchanged.
+    set_pref org.gnome.settings-daemon.plugins.power idle-dim false
+
+    # Mouse: flat acceleration, neutral speed, standard scroll direction.
+    set_pref org.gnome.desktop.peripherals.mouse accel-profile "'flat'"
+    set_pref org.gnome.desktop.peripherals.mouse speed 0.0
+    set_pref org.gnome.desktop.peripherals.mouse natural-scroll false
+
+    # Appearance and panel clock.
+    # set_pref org.gnome.desktop.interface color-scheme "'prefer-dark'"
+    set_pref org.gnome.desktop.interface enable-animations false
+    set_pref org.gnome.desktop.interface clock-format "'24h'"
+    set_pref org.gnome.desktop.interface clock-show-seconds true
+
+    # Keyboard repeat: milliseconds before repeating / between repetitions.
+    # set_pref org.gnome.desktop.peripherals.keyboard delay 250
+    # set_pref org.gnome.desktop.peripherals.keyboard repeat-interval 30
+}
+
+if command -v gsettings >/dev/null; then
+    apply_preferences
+else
+    printf 'gsettings missing; desktop preferences skipped.\n'
+fi
+
+# Retry the GNOME services for 15 attempts (up to about 75 seconds).
+# Individual D-Bus calls have a bounded timeout; no background watcher remains.
+brightness=90
+brightness_done=false
+icons_done=false
+for ((attempt=1; attempt<=15; attempt++)); do
+    if [[ $brightness_done == false ]] && command -v gdbus >/dev/null; then
+        if gdbus call --session --timeout 2 \
+            --dest org.gnome.SettingsDaemon.Power \
+            --object-path /org/gnome/SettingsDaemon/Power \
+            --method org.freedesktop.DBus.Properties.Set \
+            org.gnome.SettingsDaemon.Power.Screen Brightness \
+            "<int32 $brightness>"; then
+            brightness_done=true
+        fi
+    fi
+    if [[ $icons_done == false ]] && command -v gnome-extensions >/dev/null; then
+        if timeout 2s gnome-extensions disable ding@rastersoft.com; then
+            icons_done=true
+        fi
+    fi
+    [[ $brightness_done == true && $icons_done == true ]] && break
+    sleep 1
+done
+printf 'Brightness applied: %s; DING disabled: %s\n' "$brightness_done" "$icons_done"
+
+# Preserve your existing helper; its contents are not changed by this bundle.
+# Run here rather than on every terminal opening.
+if [[ -f "$HOME/.local/bin/flatpak-link.sh" ]]; then
+    timeout 30s sh "$HOME/.local/bin/flatpak-link.sh" ||
+        printf 'Flatpak helper failed or timed out; inspect this log.\n'
+fi
+printf 'Finished: %s\n' "$(date -Is)"
